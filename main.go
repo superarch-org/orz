@@ -19,7 +19,7 @@ func getLibc() string {
 	case "netbsd":
 		return "libc-12"
 	case "freebsd":
-		return "libc-14"
+		return "libc-7"
 	default:
 		return "unknown"
 	}
