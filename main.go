@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,68 +26,89 @@ func getLibc() string {
 	}
 }
 
-func main() {
-	if len(os.Args) < 3 || os.Args[1] != "run" {
-		fmt.Println("usage: orz run <package>")
-		os.Exit(1)
-	}
+func getLatest(pkg string) (string, error) {
+	first := string(pkg[0])
+	url := fmt.Sprintf("https://superarch.org/packages/%s/%s/latest", first, pkg)
 
-	goos := runtime.GOOS
-	arch := runtime.GOARCH
-	libc := getLibc()
-	pkg := os.Args[2]
-
-	firstLetter := string(pkg[0])
-	baseURL := fmt.Sprintf("https://superarch.org/packages/%s/%s/%s/%s/%s", firstLetter, pkg, goos, arch, libc)
-
-	resp, err := http.Get(baseURL + "/latest")
+	resp, err := http.Get(url)
 	if err != nil {
-		fmt.Printf("error: %v\n", err)
-		os.Exit(1)
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 404 {
-		fmt.Printf("package '%s' not found for %s/%s/%s\n", pkg, goos, arch, libc)
-		os.Exit(1)
+		return "", fmt.Errorf("package '%s' not found", pkg)
 	}
-
 	if resp.StatusCode != 200 {
-		fmt.Printf("error: server returned %d\n", resp.StatusCode)
-		os.Exit(1)
+		return "", fmt.Errorf("server returned %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Printf("error reading response: %v\n", err)
-		os.Exit(1)
+		return "", err
 	}
 
-	version := strings.TrimSpace(string(body))
+	return strings.TrimSpace(string(body)), nil
+}
+
+func getDeps(pkg string, version string) (map[string]string, error) {
+	first := string(pkg[0])
+	url := fmt.Sprintf("https://superarch.org/packages/%s/%s/%s.json", first, pkg, version)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 404 {
+		// no deps
+		return make(map[string]string), nil
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("server returned %d", resp.StatusCode)
+	}
+
+	var data struct {
+		Deps map[string]string `json:"deps"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, err
+	}
+
+	if data.Deps == nil {
+		return make(map[string]string), nil
+	}
+	return data.Deps, nil
+}
+
+func installPackage(pkg string, version string) (string, error) {
+	goos := runtime.GOOS
+	arch := runtime.GOARCH
+	libc := getLibc()
+	firstLetter := string(pkg[0])
 
 	home, _ := os.UserHomeDir()
 	cacheDir := filepath.Join(home, ".cache", "orz", "packages", pkg, version)
 	os.MkdirAll(cacheDir, 0755)
 
-	pkgURL := fmt.Sprintf("%s/%s.txz", baseURL, version)
+	pkgURL := fmt.Sprintf("https://superarch.org/packages/%s/%s/%s/%s/%s/%s.txz",
+		firstLetter, pkg, goos, arch, libc, version)
 	pkgPath := filepath.Join(cacheDir, version+".txz")
 
-	resp, err = http.Get(pkgURL)
+	resp, err := http.Get(pkgURL)
 	if err != nil {
-		fmt.Printf("error downloading: %v\n", err)
-		os.Exit(1)
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		fmt.Printf("error: download returned %d\n", resp.StatusCode)
-		os.Exit(1)
+		return "", fmt.Errorf("download returned %d", resp.StatusCode)
 	}
 
 	out, err := os.Create(pkgPath)
 	if err != nil {
-		fmt.Printf("error creating file: %v\n", err)
-		os.Exit(1)
+		return "", err
 	}
 
 	io.Copy(out, resp.Body)
@@ -94,10 +116,55 @@ func main() {
 
 	cmd := exec.Command("tar", "-xJf", pkgPath, "-C", cacheDir)
 	if err := cmd.Run(); err != nil {
-		fmt.Printf("error extracting: %v\n", err)
+		return "", fmt.Errorf("error extracting: %v", err)
+	}
+
+	return cacheDir, nil
+}
+
+func main() {
+	if len(os.Args) < 3 || os.Args[1] != "run" {
+		fmt.Println("usage: orz run <package>")
 		os.Exit(1)
 	}
 
-	binPath := filepath.Join(cacheDir, pkg)
-	syscall.Exec(binPath, []string{pkg}, os.Environ())
+	pkg := os.Args[2]
+
+	version, err := getLatest(pkg)
+	if err != nil {
+		fmt.Printf("error: %v\n", err)
+		os.Exit(1)
+	}
+
+	deps, err := getDeps(pkg, version)
+	if err != nil {
+		fmt.Printf("error getting deps: %v\n", err)
+		os.Exit(1)
+	}
+
+	var libPaths []string
+
+	for depPkg, depVersion := range deps {
+		depDir, err := installPackage(depPkg, depVersion)
+		if err != nil {
+			fmt.Printf("error installing dep %s: %v\n", depPkg, err)
+			os.Exit(1)
+		}
+		libPaths = append(libPaths, filepath.Join(depDir, "lib"))
+	}
+
+	pkgDir, err := installPackage(pkg, version)
+	if err != nil {
+		fmt.Printf("error installing %s: %v\n", pkg, err)
+		os.Exit(1)
+	}
+
+	binPath := filepath.Join(pkgDir, pkg)
+	env := os.Environ()
+	if len(libPaths) > 0 {
+		ldPath := strings.Join(libPaths, ":")
+		env = append(env, "LD_LIBRARY_PATH="+ldPath)
+	}
+
+	syscall.Exec(binPath, []string{pkg}, env)
 }
